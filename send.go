@@ -16,10 +16,12 @@ func SendMail(config *MailConfig, m *Message) error {
 		m.From = config.username
 	}
 
+	var auth = smtp.PlainAuth("", config.username, config.password, config.host)
+
 	if config.TLS != nil {
-		return sendWithTLS(config.Address(), config.auth, config.TLS, m)
+		return sendWithTLS(config.Address(), auth, config.TLS, m)
 	}
-	return send(config.Address(), config.auth, m)
+	return send(config.Address(), auth, m)
 }
 
 // Send an email using the given host and SMTP auth (optional), returns any error thrown by smtp.SendMail

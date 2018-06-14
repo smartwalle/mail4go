@@ -2,7 +2,6 @@ package mail4go
 
 import (
 	"crypto/tls"
-	"net/smtp"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -12,7 +11,6 @@ type MailConfig struct {
 	host     string
 	port     string
 	TLS      *tls.Config
-	auth     smtp.Auth
 }
 
 func NewMailConfig(username string, password string, host string, port string) *MailConfig {
@@ -21,7 +19,6 @@ func NewMailConfig(username string, password string, host string, port string) *
 	config.password = password
 	config.host = host
 	config.port = port
-	config.auth = smtp.PlainAuth("", username, password, host)
 	return config
 }
 
