@@ -7,11 +7,10 @@ import (
 
 func Test_SendEmail(t *testing.T) {
 	var config = &MailConfig{}
-	config.Username = "developer_mail@163.com"
-	config.Host = "smtp.163.com"
-	config.Password = "rkrntactzdinzcjk"
-	config.Port = "25"
-	config.Secure = false
+	config.username = "developer_mail@163.com"
+	config.host = "smtp.163.com"
+	config.password = "rkrntactzdinzcjk"
+	config.port = "25"
 
 	var e = NewHtmlMessage("title", "<a href='http://www.google.com'>Google</a>")
 	e.From = "From<developer_mail@163.com>"

@@ -3,52 +3,219 @@
 package mail4go
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
+	"net/mail"
 	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
-	MaxLineLength = 76
+	MaxLineLength      = 76                             // MaxLineLength is the maximum line length per RFC 2045
+	defaultContentType = "text/plain; charset=us-ascii" // defaultContentType is the default Content-Type according to RFC 2045, section 5.2
 )
 
-////////////////////////////////////////////////////////////////////////////////
+// ErrMissingBoundary is returned when there is no boundary given for a multipart entity
+var ErrMissingBoundary = errors.New("No boundary found for multipart entity")
+
+// ErrMissingContentType is returned when there is no "Content-Type" header for a MIME entity
+var ErrMissingContentType = errors.New("No Content-Type found for MIME entity")
+
+// Message is the type used for email messages
 type Message struct {
-	From 		string
-	ReplyTo		string
+	From        string
+	ReplyTo     string
 	To          []string
 	Bcc         []string
 	Cc          []string
 	Subject     string
-	Content     string
+	Content     []byte
 	ContentType string
 	Headers     textproto.MIMEHeader
 	Attachments []*Attachment
+	ReadReceipt []string
 }
 
-// NewEmail creates an Email, and returns the pointer to it.
-func NewMessage(subject string, content string, contentType string) *Message {
-	var email = &Message{Headers: textproto.MIMEHeader{}}
-	email.Subject = subject
-	email.Content = content
-	email.ContentType = contentType
-	return email
+// part is a copyable representation of a multipart.Part
+type part struct {
+	header textproto.MIMEHeader
+	body   []byte
+}
+
+// newMessage creates an Message, and returns the pointer to it.
+func newMessage() *Message {
+	return &Message{Headers: textproto.MIMEHeader{}}
 }
 
 func NewTextMessage(subject string, content string) *Message {
-	return NewMessage(subject, content, "text/plain")
+	var m = newMessage()
+	m.Subject = subject
+	m.Content = []byte(content)
+	m.ContentType = "text/plain"
+	return m
 }
 
 func NewHtmlMessage(subject string, content string) *Message {
-	return NewMessage(subject, content, "text/html")
+	var m = newMessage()
+	m.Subject = subject
+	m.Content = []byte(content)
+	m.ContentType = "text/html"
+	return m
+}
+
+// trimReader is a custom io.Reader that will trim any leading
+// whitespace, as this can cause email imports to fail.
+type trimReader struct {
+	rd io.Reader
+}
+
+// Read trims off any unicode whitespace from the originating reader
+func (tr trimReader) Read(buf []byte) (int, error) {
+	n, err := tr.rd.Read(buf)
+	t := bytes.TrimLeftFunc(buf[:n], unicode.IsSpace)
+	n = copy(buf, t)
+	return n, err
+}
+
+// NewEmailFromReader reads a stream of bytes from an io.Reader, r,
+// and returns an email struct containing the parsed data.
+// This function expects the data in RFC 5322 format.
+func NewEmailFromReader(r io.Reader) (*Message, error) {
+	m := newMessage()
+	s := trimReader{rd: r}
+	tp := textproto.NewReader(bufio.NewReader(s))
+	// Parse the main headers
+	hdrs, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return m, err
+	}
+	// Set the subject, to, cc, bcc, and from
+	for h, v := range hdrs {
+		switch {
+		case h == "Subject":
+			m.Subject = v[0]
+			delete(hdrs, h)
+		case h == "To":
+			m.To = v
+			delete(hdrs, h)
+		case h == "Cc":
+			m.Cc = v
+			delete(hdrs, h)
+		case h == "Bcc":
+			m.Bcc = v
+			delete(hdrs, h)
+		case h == "From":
+			m.From = v[0]
+			delete(hdrs, h)
+		case h == "Reply-To":
+			m.ReplyTo = v[0]
+			delete(hdrs, h)
+		}
+	}
+	m.Headers = hdrs
+	body := tp.R
+	// Recursively parse the MIME parts
+	ps, err := parseMIMEParts(m.Headers, body)
+	if err != nil {
+		return m, err
+	}
+	for _, p := range ps {
+		if ct := p.header.Get("Content-Type"); ct == "" {
+			return m, ErrMissingContentType
+		}
+		ct, _, err := mime.ParseMediaType(p.header.Get("Content-Type"))
+		if err != nil {
+			return m, err
+		}
+
+		switch {
+		case ct == "text/plain":
+			fallthrough
+		case ct == "text/html":
+			m.Content = p.body
+			m.ContentType = ct
+		}
+	}
+	return m, nil
+}
+
+// parseMIMEParts will recursively walk a MIME entity and return a []mime.Part containing
+// each (flattened) mime.Part found.
+// It is important to note that there are no limits to the number of recursions, so be
+// careful when parsing unknown MIME structures!
+func parseMIMEParts(hs textproto.MIMEHeader, b io.Reader) ([]*part, error) {
+	var ps []*part
+	// If no content type is given, set it to the default
+	if _, ok := hs["Content-Type"]; !ok {
+		hs.Set("Content-Type", defaultContentType)
+	}
+	ct, params, err := mime.ParseMediaType(hs.Get("Content-Type"))
+	if err != nil {
+		return ps, err
+	}
+	// If it's a multipart email, recursively parse the parts
+	if strings.HasPrefix(ct, "multipart/") {
+		if _, ok := params["boundary"]; !ok {
+			return ps, ErrMissingBoundary
+		}
+		mr := multipart.NewReader(b, params["boundary"])
+		for {
+			var buf bytes.Buffer
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return ps, err
+			}
+			if _, ok := p.Header["Content-Type"]; !ok {
+				p.Header.Set("Content-Type", defaultContentType)
+			}
+			subct, _, err := mime.ParseMediaType(p.Header.Get("Content-Type"))
+			if strings.HasPrefix(subct, "multipart/") {
+				sps, err := parseMIMEParts(p.Header, p)
+				if err != nil {
+					return ps, err
+				}
+				ps = append(ps, sps...)
+			} else {
+				var reader io.Reader
+				reader = p
+				const cte = "Content-Transfer-Encoding"
+				if p.Header.Get(cte) == "base64" {
+					reader = base64.NewDecoder(base64.StdEncoding, reader)
+				}
+				// Otherwise, just append the part to the list
+				// Copy the part data into the buffer
+				if _, err := io.Copy(&buf, reader); err != nil {
+					return ps, err
+				}
+				ps = append(ps, &part{body: buf.Bytes(), header: p.Header})
+			}
+		}
+	} else {
+		// If it is not a multipart email, parse the body content as a single "part"
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, b); err != nil {
+			return ps, err
+		}
+		ps = append(ps, &part{body: buf.Bytes(), header: hs})
+	}
+	return ps, nil
 }
 
 // Attach is used to attach content from an io.Reader to the email.
@@ -80,28 +247,30 @@ func (m *Message) Attach(r io.Reader, filename string, c string) (a *Attachment,
 
 // AttachFile is used to attach content to the email.
 // It attempts to open the file referenced by filename and, if successful, creates an Attachment.
-// This Attachment is then appended to the slice of Email.Attachments.
+// This Attachment is then appended to the slice of Message.Attachments.
 // The function will then return the Attachment for reference, as well as nil for the error, if successful.
 func (m *Message) AttachFile(filename string) (a *Attachment, err error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return
 	}
+	defer f.Close()
+
 	ct := mime.TypeByExtension(filepath.Ext(filename))
 	basename := filepath.Base(filename)
 	return m.Attach(f, basename, ct)
 }
 
-// msgHeaders merges the Email's various fields and custom headers together in a
+// msgHeaders merges the Message's various fields and custom headers together in a
 // standards compliant way to create a MIMEHeader to be used in the resulting
 // message. It does not alter e.Headers.
 //
 // "e"'s fields To, Cc, From, Subject will be used unless they are present in
 // e.Headers. Unless set in e.Headers, "Date" will filled with the current time.
-func (m *Message) msgHeaders() textproto.MIMEHeader {
+func (m *Message) msgHeaders() (textproto.MIMEHeader, error) {
 	res := make(textproto.MIMEHeader, len(m.Headers)+4)
 	if m.Headers != nil {
-		for _, h := range []string{"To", "Cc", "From", "Reply-To", "Subject", "Date"} {
+		for _, h := range []string{"To", "Cc", "From", "Reply-To", "Subject", "Date", "Message-Id", "MIME-Version"} {
 			if v, ok := m.Headers[h]; ok {
 				res[h] = v
 			}
@@ -117,64 +286,110 @@ func (m *Message) msgHeaders() textproto.MIMEHeader {
 	if _, ok := res["Subject"]; !ok && m.Subject != "" {
 		res.Set("Subject", m.Subject)
 	}
+	if _, ok := res["Message-Id"]; !ok {
+		id, err := generateMessageID()
+		if err != nil {
+			return nil, err
+		}
+		res.Set("Message-Id", id)
+	}
 	// Date and From are required headers.
 	if _, ok := res["From"]; !ok {
 		res.Set("From", m.From)
 	}
-	if _, ok := res["Reply-To"]; !ok && m.ReplyTo != ""{
+	if _, ok := res["Reply-To"]; !ok && m.ReplyTo != "" {
 		res.Set("Reply-To", m.ReplyTo)
 	}
 	if _, ok := res["Date"]; !ok {
 		res.Set("Date", time.Now().Format(time.RFC1123Z))
 	}
-	if _, ok := res["Mime-Version"]; !ok {
-		res.Set("Mime-Version", "1.0")
+	if _, ok := res["MIME-Version"]; !ok {
+		res.Set("MIME-Version", "1.0")
 	}
 	for field, vals := range m.Headers {
 		if _, ok := res[field]; !ok {
 			res[field] = vals
 		}
 	}
-	return res
+	return res, nil
 }
 
-// Bytes converts the Email object to a []byte representation, including all needed MIMEHeaders, boundaries, etc.
+func writeMessage(buff *bytes.Buffer, msg []byte, multipart bool, mediaType string, w *multipart.Writer) error {
+	if multipart {
+		header := textproto.MIMEHeader{
+			"Content-Type":              {mediaType + "; charset=UTF-8"},
+			"Content-Transfer-Encoding": {"quoted-printable"},
+		}
+		if _, err := w.CreatePart(header); err != nil {
+			return err
+		}
+	}
+
+	qp := quotedprintable.NewWriter(buff)
+	// Write the text
+	if _, err := qp.Write(msg); err != nil {
+		return err
+	}
+	return qp.Close()
+}
+
+// Bytes converts the Message object to a []byte representation, including all needed MIMEHeaders, boundaries, etc.
 func (m *Message) Bytes() ([]byte, error) {
-	// TODO: better guess buffer size
 	buff := bytes.NewBuffer(make([]byte, 0, 4096))
 
-	headers := m.msgHeaders()
-	w := multipart.NewWriter(buff)
-	// TODO: determine the content type based on message/attachment mix.
-	headers.Set("Content-Type", "multipart/mixed;\r\n boundary="+w.Boundary())
+	headers, err := m.msgHeaders()
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		isMixed       = len(m.Attachments) > 0
+		isAlternative = len(m.Content) > 0
+	)
+
+	var w *multipart.Writer
+	if isMixed || isAlternative {
+		w = multipart.NewWriter(buff)
+	}
+	switch {
+	case isMixed:
+		headers.Set("Content-Type", "multipart/mixed;\r\n boundary="+w.Boundary())
+	case isAlternative:
+		headers.Set("Content-Type", "multipart/alternative;\r\n boundary="+w.Boundary())
+	default:
+		headers.Set("Content-Type", fmt.Sprintf("%s; charset=UTF-8", m.ContentType))
+		headers.Set("Content-Transfer-Encoding", "quoted-printable")
+	}
 	headerToBytes(buff, headers)
 	io.WriteString(buff, "\r\n")
 
-	// Start the multipart/mixed part
-	fmt.Fprintf(buff, "--%s\r\n", w.Boundary())
-	header := textproto.MIMEHeader{}
-	// Check to see if there is a Text or HTML field
+	// Check to see if there is a text or html field
 	if len(m.Content) > 0 {
-		subWriter := multipart.NewWriter(buff)
-		// Create the multipart alternative part
-		header.Set("Content-Type", fmt.Sprintf("multipart/alternative;\r\n boundary=%s\r\n", subWriter.Boundary()))
-		// Write the header
-		headerToBytes(buff, header)
-		// Create the body sections
-		if len(m.Content) > 0 {
-			header.Set("Content-Type", fmt.Sprintf("%s; charset=UTF-8", m.ContentType))
-			header.Set("Content-Transfer-Encoding", "quoted-printable")
-			if _, err := subWriter.CreatePart(header); err != nil {
+		var subWriter *multipart.Writer
+
+		if isMixed && isAlternative {
+			// Create the multipart alternative part
+			subWriter = multipart.NewWriter(buff)
+			header := textproto.MIMEHeader{
+				"Content-Type": {"multipart/alternative;\r\n boundary=" + subWriter.Boundary()},
+			}
+			if _, err := w.CreatePart(header); err != nil {
 				return nil, err
 			}
-			// Write the text
-			if err := quotePrintEncode(buff, []byte(m.Content)); err != nil {
+		} else {
+			subWriter = w
+		}
+		// Create the body sections
+		if len(m.Content) > 0 {
+			// Write the html
+			if err := writeMessage(buff, m.Content, isMixed || isAlternative, m.ContentType, subWriter); err != nil {
 				return nil, err
 			}
 		}
-
-		if err := subWriter.Close(); err != nil {
-			return nil, err
+		if isMixed && isAlternative {
+			if err := subWriter.Close(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Create attachment part, if necessary
@@ -186,87 +401,29 @@ func (m *Message) Bytes() ([]byte, error) {
 		// Write the base64Wrapped content to the part
 		base64Wrap(ap, a.Content)
 	}
-	if err := w.Close(); err != nil {
-		return nil, err
+	if isMixed || isAlternative {
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
 	}
 	return buff.Bytes(), nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
+// Select and parse an SMTP envelope sender address.  Choose Message.Sender if set, or fallback to Message.From.
+func (m *Message) parseSender() (string, error) {
+	from, err := mail.ParseAddress(m.From)
+	if err != nil {
+		return "", err
+	}
+	return from.Address, nil
+}
+
 // Attachment is a struct representing an email attachment.
 // Based on the mime/multipart.FileHeader struct, Attachment contains the name, MIMEHeader, and content of the attachment in question
 type Attachment struct {
 	Filename string
 	Header   textproto.MIMEHeader
 	Content  []byte
-}
-
-// quotePrintEncode writes the quoted-printable text to the IO Writer (according to RFC 2045)
-func quotePrintEncode(w io.Writer, body []byte) error {
-	var buf [3]byte
-	mc := 0
-	for _, c := range body {
-		// We're assuming Unix style text formats as input (LF line break), and
-		// quoted-printable uses CRLF line breaks. (Literal CRs will become
-		// "=0D", but probably shouldn't be there to begin with!)
-		if c == '\n' {
-			io.WriteString(w, "\r\n")
-			mc = 0
-			continue
-		}
-
-		var nextOut []byte
-		if isPrintable[c] {
-			buf[0] = c
-			nextOut = buf[:1]
-		} else {
-			nextOut = buf[:]
-			qpEscape(nextOut, c)
-		}
-
-		// Add a soft line break if the next (encoded) byte would push this line
-		// to or past the limit.
-		if mc+len(nextOut) >= MaxLineLength {
-			if _, err := io.WriteString(w, "=\r\n"); err != nil {
-				return err
-			}
-			mc = 0
-		}
-
-		if _, err := w.Write(nextOut); err != nil {
-			return err
-		}
-		mc += len(nextOut)
-	}
-	// No trailing end-of-line?? Soft line break, then. TODO: is this sane?
-	if mc > 0 {
-		io.WriteString(w, "=\r\n")
-	}
-	return nil
-}
-
-// isPrintable holds true if the byte given is "printable" according to RFC 2045, false otherwise
-var isPrintable [256]bool
-
-func init() {
-	for c := '!'; c <= '<'; c++ {
-		isPrintable[c] = true
-	}
-	for c := '>'; c <= '~'; c++ {
-		isPrintable[c] = true
-	}
-	isPrintable[' '] = true
-	isPrintable['\n'] = true
-	isPrintable['\t'] = true
-}
-
-// qpEscape is a helper function for quotePrintEncode which escapes a
-// non-printable byte. Expects len(dest) == 3.
-func qpEscape(dest []byte, c byte) {
-	const nums = "0123456789ABCDEF"
-	dest[0] = '='
-	dest[1] = nums[(c&0xf0)>>4]
-	dest[2] = nums[(c & 0xf)]
 }
 
 // base64Wrap encodes the attachment content, and wraps it according to RFC 2045 standards (every 76 chars)
@@ -300,8 +457,41 @@ func headerToBytes(buff *bytes.Buffer, header textproto.MIMEHeader) {
 			// bytes.Buffer.Write() never returns an error.
 			io.WriteString(buff, field)
 			io.WriteString(buff, ": ")
-			io.WriteString(buff, subval)
+			// Write the encoded header if needed
+			switch {
+			case field == "Content-Type" || field == "Content-Disposition":
+				buff.Write([]byte(subval))
+			default:
+				buff.Write([]byte(mime.QEncoding.Encode("UTF-8", subval)))
+			}
 			io.WriteString(buff, "\r\n")
 		}
 	}
+}
+
+var maxBigInt = big.NewInt(math.MaxInt64)
+
+// generateMessageID generates and returns a string suitable for an RFC 2822
+// compliant Message-ID, e.g.:
+// <1444789264909237300.3464.1819418242800517193@DESKTOP01>
+//
+// The following parameters are used to generate a Message-ID:
+// - The nanoseconds since Epoch
+// - The calling PID
+// - A cryptographically random int64
+// - The sending hostname
+func generateMessageID() (string, error) {
+	t := time.Now().UnixNano()
+	pid := os.Getpid()
+	rint, err := rand.Int(rand.Reader, maxBigInt)
+	if err != nil {
+		return "", err
+	}
+	h, err := os.Hostname()
+	// If we can't get the hostname, we'll use localhost
+	if err != nil {
+		h = "localhost.localdomain"
+	}
+	msgid := fmt.Sprintf("<%d.%d.%d@%s>", t, pid, rint, h)
+	return msgid, nil
 }
