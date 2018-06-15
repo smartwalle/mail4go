@@ -12,8 +12,12 @@ func SendMail(config *MailConfig, m *Message) error {
 	if config == nil {
 		return errors.New("config 不能为空")
 	}
-	if len(m.From) == 0 {
-		m.From = config.username
+	if m.From == "" {
+		if config.From != "" {
+			m.From = config.From
+		} else {
+			m.From = config.username
+		}
 	}
 
 	var auth = smtp.PlainAuth("", config.username, config.password, config.host)

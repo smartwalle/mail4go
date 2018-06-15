@@ -10,6 +10,7 @@ type MailConfig struct {
 	password string
 	host     string
 	port     string
+	From     string
 	TLS      *tls.Config
 }
 
