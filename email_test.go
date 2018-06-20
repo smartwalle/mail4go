@@ -16,5 +16,5 @@ func Test_SendEmail(t *testing.T) {
 	e.From = "From<smartwalle@163.com>"
 	e.To = []string{"917996695@qq.com"}
 
-	fmt.Println(SendMail(config, e))
+	fmt.Println(SendWithConfig(config, e))
 }

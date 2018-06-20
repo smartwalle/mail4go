@@ -8,7 +8,7 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-func SendMail(config *MailConfig, m *Message) error {
+func SendWithConfig(config *MailConfig, m *Message) error {
 	if config == nil {
 		return errors.New("config 不能为空")
 	}
@@ -19,17 +19,20 @@ func SendMail(config *MailConfig, m *Message) error {
 			m.From = config.username
 		}
 	}
-
-	var auth = smtp.PlainAuth("", config.username, config.password, config.host)
-
-	if config.TLS != nil {
-		return sendWithTLS(config.Address(), auth, config.TLS, m)
-	}
-	return send(config.Address(), auth, m)
+	return Send(config.username, config.password, config.host, config.port, config.TLS, m)
 }
 
-// Send an email using the given host and SMTP auth (optional), returns any error thrown by smtp.SendMail
-// This function merges the To, Cc, and Bcc fields and calls the smtp.SendMail function using the Message.Bytes() output as the message
+func Send(username, password, host, port string, tls *tls.Config, m *Message) error {
+	var auth = smtp.PlainAuth("", username, password, host)
+	var addr = host + ":" + port
+	if tls != nil {
+		return sendWithTLS(addr, auth, tls, m)
+	}
+	return send(addr, auth, m)
+}
+
+// Send an email using the given host and SMTP auth (optional), returns any error thrown by smtp.SendWithConfig
+// This function merges the To, Cc, and Bcc fields and calls the smtp.SendWithConfig function using the Message.Bytes() output as the message
 func send(addr string, a smtp.Auth, m *Message) error {
 	// Merge the To, Cc, and Bcc fields
 	to := make([]string, 0, len(m.To)+len(m.Cc)+len(m.Bcc))

@@ -22,7 +22,3 @@ func NewMailConfig(username string, password string, host string, port string) *
 	config.port = port
 	return config
 }
-
-func (this *MailConfig) Address() string {
-	return this.host + ":" + this.port
-}
