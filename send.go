@@ -23,6 +23,9 @@ func SendWithConfig(config *MailConfig, m *Message) error {
 }
 
 func Send(username, password, host, port string, tls *tls.Config, m *Message) error {
+	if m .From == "" {
+		m.From = username
+	}
 	var auth = smtp.PlainAuth("", username, password, host)
 	var addr = host + ":" + port
 	if tls != nil {
