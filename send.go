@@ -7,7 +7,7 @@ import (
 	"net/smtp"
 )
 
-type SendFunc func(addr string, a smtp.Auth, t *tls.Config, m *Message) error
+type sender func(addr string, a smtp.Auth, t *tls.Config, m *Message) error
 
 func SendWithConfig(config *MailConfig, m *Message) error {
 	if config == nil {
@@ -29,17 +29,17 @@ func SendWithConfig(config *MailConfig, m *Message) error {
 	return Send(config.username, config.password, config.host, config.port, m)
 }
 
-func sendWrapper(username, password, host, port string, t *tls.Config, m *Message, sendFunc SendFunc) error {
+func _send(username, password, host, port string, t *tls.Config, m *Message, s sender) error {
 	if m.From == "" {
 		m.From = username
 	}
 	var auth = smtp.PlainAuth("", username, password, host)
 	var addr = host + ":" + port
-	return sendFunc(addr, auth, t, m)
+	return s(addr, auth, t, m)
 }
 
 func Send(username, password, host, port string, m *Message) error {
-	return sendWrapper(username, password, host, port, nil, m, send)
+	return _send(username, password, host, port, nil, m, send)
 }
 
 func send(addr string, a smtp.Auth, t *tls.Config, m *Message) error {
@@ -69,7 +69,7 @@ func send(addr string, a smtp.Auth, t *tls.Config, m *Message) error {
 }
 
 func SendWithTLS(username, password, host, port string, t *tls.Config, m *Message) error {
-	return sendWrapper(username, password, host, port, t, m, sendWithTLS)
+	return _send(username, password, host, port, t, m, sendWithTLS)
 }
 
 func sendWithTLS(addr string, a smtp.Auth, t *tls.Config, m *Message) error {
@@ -141,7 +141,7 @@ func sendWithTLS(addr string, a smtp.Auth, t *tls.Config, m *Message) error {
 }
 
 func SendWithStartTLS(username, password, host, port string, t *tls.Config, m *Message) error {
-	return sendWrapper(username, password, host, port, t, m, sendWithStartTLS)
+	return _send(username, password, host, port, t, m, sendWithStartTLS)
 }
 
 func sendWithStartTLS(addr string, a smtp.Auth, t *tls.Config, m *Message) error {
