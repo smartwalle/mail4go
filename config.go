@@ -12,6 +12,7 @@ type MailConfig struct {
 	port     string
 	From     string
 	TLS      *tls.Config
+	StartTLS bool
 }
 
 func NewMailConfig(username string, password string, host string, port string) *MailConfig {
